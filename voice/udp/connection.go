@@ -8,6 +8,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/diamondburned/arikawa/v3/utils/wsutil"
 	"github.com/pkg/errors"
 	"golang.org/x/crypto/nacl/secretbox"
 )
@@ -48,7 +49,7 @@ type Connection struct {
 	timestamp uint32
 	nonce     [24]byte
 
-	closed bool
+	closed chan struct{}
 }
 
 // DialConnection dials the UDP connection using the given address and SSRC
@@ -120,6 +121,7 @@ func DialConnectionCustom(
 		recvBuffer:  make([]byte, 1400),
 		recvOpus:    make([]byte, 1400),
 		sendPacket:  packet,
+		closed:      make(chan struct{}),
 	}, nil
 }
 
@@ -160,11 +162,13 @@ func (c *Connection) UseSecret(secret [32]byte) {
 
 // Close closes the connection.
 func (c *Connection) Close() error {
-	if c.closed {
+	if c.IsClosed() {
 		return nil
 	}
 
-	c.closed = true
+	wsutil.WSDebug("UDP connection closed")
+	close(c.closed)
+
 	c.frequency.Stop()
 	close(c.freqStop)
 	return c.conn.Close()
@@ -230,6 +234,16 @@ func (p *Packet) SSRC() uint32 { return binary.BigEndian.Uint32(p.header[8:12]) 
 func (p *Packet) Copy(dst *Packet) {
 	dst.header = append(dst.header[:0], p.header...)
 	dst.Opus = append(dst.Opus[:0], p.Opus...)
+}
+
+// IsClosed returns whether the connection is closed.
+func (c *Connection) IsClosed() bool {
+	select {
+	case <-c.closed:
+		return true
+	default:
+		return false
+	}
 }
 
 const packetHeaderSize = 12

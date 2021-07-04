@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/diamondburned/arikawa/v3/utils/wsutil"
 	"github.com/pkg/errors"
 )
 
@@ -23,7 +24,6 @@ type Manager struct {
 	dialer *net.Dialer
 
 	stopMu   sync.Mutex
-	stopConn chan struct{}
 	stopDial context.CancelFunc
 
 	// conn state
@@ -44,7 +44,6 @@ func NewManager() *Manager {
 func NewManagerWithDialer(d *net.Dialer) *Manager {
 	return &Manager{
 		dialer:   d,
-		stopConn: make(chan struct{}),
 		connLock: make(chan struct{}, 1),
 	}
 }
@@ -69,16 +68,12 @@ func (m *Manager) Close() (err error) {
 		m.stopDial = nil
 	}
 
-	// Stop existing Manager users.
-	select {
-	case <-m.stopConn:
-		// m.stopConn already closed
-	default:
-		close(m.stopConn)
-	}
-
-	// Acquire the dial lock to ensure that it's done.
+	// Close the underlying connection.
 	m.connLock <- struct{}{}
+	if m.conn != nil {
+		m.conn.Close()
+		m.conn = nil
+	}
 	<-m.connLock
 
 	return nil
@@ -108,6 +103,10 @@ func (m *Manager) PauseAndDial(ctx context.Context, addr string, ssrc uint32) (*
 		return nil, ctx.Err()
 	}
 
+	if m.conn != nil {
+		m.conn.Close()
+	}
+
 	m.stopMu.Lock()
 	// Allow cancelling from another goroutine with this context.
 	ctx, cancel := context.WithCancel(ctx)
@@ -131,7 +130,6 @@ func (m *Manager) PauseAndDial(ctx context.Context, addr string, ssrc uint32) (*
 
 	m.stopMu.Lock()
 	m.stopDial = nil
-	m.stopConn = make(chan struct{})
 	m.stopMu.Unlock()
 
 	return conn, nil
@@ -155,12 +153,20 @@ func (m *Manager) ResetFrequency(frameDuration time.Duration, timeIncr uint32) {
 // ReadPacket reads the current packet. It blocks until a packet arrives or
 // the Manager is closed.
 func (m *Manager) ReadPacket() (p *Packet, err error) {
-	conn := m.acquireConn()
-	if conn == nil {
-		return nil, ErrManagerClosed
-	}
+	for {
+		conn := m.acquireConn()
+		if conn == nil {
+			return nil, ErrManagerClosed
+		}
 
-	return conn.ReadPacket()
+		p, err = conn.ReadPacket()
+		if err != nil && conn.IsClosed() {
+			wsutil.WSDebug("UDP connection was closed, re-attempting read...")
+			continue
+		}
+
+		return p, err
+	}
 }
 
 // Write writes to the current connection in the manager. It blocks if the
@@ -177,15 +183,8 @@ func (m *Manager) Write(b []byte) (n int, err error) {
 // acquireConn acquires the current connection and releases the lock, returning
 // the connection at that point in time. Nil is returned if Manager is closed.
 func (m *Manager) acquireConn() *Connection {
-	m.stopMu.Lock()
-	defer m.stopMu.Unlock()
-
-	select {
-	case m.connLock <- struct{}{}:
-		defer func() { <-m.connLock }()
-	case <-m.stopConn:
-		return nil
-	}
+	m.connLock <- struct{}{}
+	defer func() { <-m.connLock }()
 
 	return m.conn
 }
